@@ -1,0 +1,69 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: production
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backupLimit: 1
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: postgres:16-alpine
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+                  BACKUP_FILE="/backups/suidex-${TIMESTAMP}.sql.gz"
+                  echo "Starting backup: ${BACKUP_FILE}"
+                  pg_dump -h suidex-postgres -U "$PGUSER" -d "$PGDATABASE" | gzip > "${BACKUP_FILE}"
+                  echo "Backup complete: $(du -h ${BACKUP_FILE})"
+                  
+                  # Upload to GCS
+                  gsutil cp "${BACKUP_FILE}" "gs://${GCS_BUCKET}/postgres-backups/"
+                  echo "Uploaded to GCS: gs://${GCS_BUCKET}/postgres-backups/"
+                  
+                  # Cleanup local backups older than 7 days
+                  find /backups -name "*.sql.gz" -mtime +7 -delete
+              env:
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-secrets
+                      key: username
+                - name: PGDATABASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-secrets
+                      key: database
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-secrets
+                      key: password
+                - name: GCS_BUCKET
+                  value: "suidex-backups"
+              volumeMounts:
+                - name: backup-storage
+                  mountPath: /backups
+              resources:
+                requests:
+                  cpu: 200m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+          volumes:
+            - name: backup-storage
+              emptyDir:
+                sizeLimit: 10Gi
